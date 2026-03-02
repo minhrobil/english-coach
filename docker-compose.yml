@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: english-coach-postgres
+    environment:
+      POSTGRES_DB: english_coach
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - english_coach_pgdata:/var/lib/postgresql/data
+
+  backend:
+    image: maven:3.9.9-eclipse-temurin-21
+    container_name: english-coach-backend
+    working_dir: /workspace
+    command: mvn spring-boot:run -Dspring-boot.run.profiles=local
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/english_coach
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./backend:/workspace
+    depends_on:
+      - postgres
+
+volumes:
+  english_coach_pgdata:

@@ -1,0 +1,14 @@
+server:
+  port: 8088
+
+spring:
+  profiles:
+    active: local
+  application:
+    name: english-coach-backend
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
