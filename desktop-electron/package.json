@@ -7,11 +7,13 @@
   "scripts": {
     "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
     "dev:renderer": "vite",
-    "dev:electron": "set ELECTRON_RUN_AS_NODE=&& wait-on tcp:5173 && tsc -p tsconfig.node.json && copy /Y electron\\preload.cjs dist-electron\\electron\\preload.cjs >nul && electron .",
+    "copy:preload": "node -e \"const fs=require('fs'); fs.mkdirSync('dist-electron/electron',{ recursive:true }); fs.copyFileSync('electron/preload.cjs','dist-electron/electron/preload.cjs');\"",
+    "run:electron": "node ./scripts/run-electron.cjs",
+    "dev:electron": "wait-on tcp:5173 && tsc -p tsconfig.node.json && npm run copy:preload && npm run run:electron",
     "build": "npm run build:renderer && npm run build:electron",
     "build:renderer": "vite build",
-    "build:electron": "tsc -p tsconfig.node.json && copy /Y electron\\preload.cjs dist-electron\\electron\\preload.cjs >nul",
-    "start": "set ELECTRON_RUN_AS_NODE=&& electron ."
+    "build:electron": "tsc -p tsconfig.node.json && npm run copy:preload",
+    "start": "npm run run:electron"
   },
   "dependencies": {
     "electron-store": "^10.0.1",
