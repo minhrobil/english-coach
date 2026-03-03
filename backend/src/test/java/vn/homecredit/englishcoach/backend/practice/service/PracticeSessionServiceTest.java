@@ -28,8 +28,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -53,7 +55,7 @@ class PracticeSessionServiceTest {
 
     @Test
     void createInstantPrompt_retriesWhenCandidateTooSimilarToRecentPrompt() {
-        when(jdbcTemplate.query(anyString(), any(RowMapper.class), any())).thenAnswer(invocation -> {
+        when(jdbcTemplate.query(anyString(), any(RowMapper.class), any(), any(), any())).thenAnswer(invocation -> {
             RowMapper<String> mapper = invocation.getArgument(1);
             ResultSet rs = mock(ResultSet.class);
             when(rs.getString("source_sentence")).thenReturn("Bệnh viện cần tăng cường phòng ngừa lây nhiễm trong mùa dịch.");
@@ -88,7 +90,7 @@ class PracticeSessionServiceTest {
 
         when(openAiEvaluationClient.generatePrompt(any())).thenReturn(tooSimilar, accepted);
 
-        PracticeSessionService.PracticePromptData result = service.createInstantPrompt("healthcare", "medium");
+        PracticeSessionService.PracticePromptData result = service.createInstantPrompt("user@test.com", "healthcare", "medium");
 
         assertEquals(accepted.promptText(), result.promptText());
         verify(openAiEvaluationClient, times(2)).generatePrompt(any());
@@ -98,7 +100,7 @@ class PracticeSessionServiceTest {
     void createInstantPrompt_usesCoreKeywordsFromPreviousPromptAsExcludedWords() {
         doReturn(List.of("Nội dung bất kỳ"))
                 .when(jdbcTemplate)
-                .query(anyString(), any(RowMapper.class), any());
+                .query(anyString(), any(RowMapper.class), any(), any(), any());
 
         OpenAiEvaluationClient.GeneratedPrompt firstAccepted = new OpenAiEvaluationClient.GeneratedPrompt(
                 "vi_to_en",
@@ -142,8 +144,8 @@ class PracticeSessionServiceTest {
         when(openAiEvaluationClient.generatePrompt(any()))
                 .thenReturn(firstAccepted, overlappedKeywords, secondAccepted);
 
-        service.createInstantPrompt("healthcare", "medium");
-        PracticeSessionService.PracticePromptData result = service.createInstantPrompt("healthcare", "medium");
+        service.createInstantPrompt("user@test.com", "healthcare", "medium");
+        PracticeSessionService.PracticePromptData result = service.createInstantPrompt("user@test.com", "healthcare", "medium");
 
         ArgumentCaptor<OpenAiEvaluationClient.GeneratePromptRequest> captor =
                 ArgumentCaptor.forClass(OpenAiEvaluationClient.GeneratePromptRequest.class);
@@ -153,6 +155,36 @@ class PracticeSessionServiceTest {
         assertTrue(secondCallFirstAttempt.excludedWords().contains("hospital"));
         assertTrue(secondCallFirstAttempt.excludedWords().contains("patient"));
         assertEquals(secondAccepted.promptText(), result.promptText());
+    }
+
+    @Test
+    void createInstantPrompt_queriesRecentPromptsByUserAndTopic() {
+        doReturn(List.of("Please review my project report before noon."))
+                .when(jdbcTemplate)
+                .query(anyString(), any(RowMapper.class), any(), any(), any());
+        OpenAiEvaluationClient.GeneratedPrompt accepted = new OpenAiEvaluationClient.GeneratedPrompt(
+                "vi_to_en",
+                "Bạn có thể giúp tôi mua vài món ở siêu thị tối nay không?",
+                "Could you help me buy a few items at the supermarket tonight?",
+                new OpenAiEvaluationClient.PromptHint(
+                        "Could you + base verb",
+                        "Could you + base verb + object + time?",
+                        List.of("supermarket", "buy", "items"),
+                        "Câu nhờ vả lịch sự trong giao tiếp hằng ngày."
+                ),
+                List.of("supermarket", "buy", "items")
+        );
+        when(openAiEvaluationClient.generatePrompt(any())).thenReturn(accepted);
+
+        service.createInstantPrompt("user@test.com", "shopping", "medium");
+
+        verify(jdbcTemplate, atLeast(2)).query(
+                anyString(),
+                any(RowMapper.class),
+                eq("user@test.com"),
+                eq("shopping"),
+                any()
+        );
     }
 
     @Test
@@ -302,10 +334,14 @@ class PracticeSessionServiceTest {
                 "A better sentence",
                 List.of(new OpenAiEvaluationClient.VocabularyHint("triage", "phân loại", "y tế"))
         );
+        UUID promptId = UUID.randomUUID();
         when(openAiEvaluationClient.evaluate(any())).thenReturn(evaluated);
+        when(jdbcTemplate.queryForObject(anyString(), eq(String.class), eq("user@test.com"), eq(promptId)))
+                .thenReturn("shopping");
+
         PracticeSessionService.PracticeSubmissionData result = service.submitAndEvaluate(
                 "user@test.com",
-                UUID.randomUUID(),
+                promptId,
                 "Câu gốc",
                 "Câu trả lời",
                 "Câu tham chiếu"
@@ -314,6 +350,7 @@ class PracticeSessionServiceTest {
         assertEquals(82, result.overallScore());
         assertEquals("COMPLETED", result.evaluationStatus());
         assertFalse(result.vocabularyHints().isEmpty());
+        verify(jdbcTemplate).queryForObject(anyString(), eq(String.class), eq("user@test.com"), eq(promptId));
     }
 
     @Test

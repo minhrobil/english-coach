@@ -25,8 +25,9 @@ public class PracticeController {
 
     @PostMapping("/instant-session")
     public ResponseEntity<PracticePromptResponse> createInstantSession(@RequestBody InstantSessionRequest request) {
+        String userEmail = currentUserService.requireUserEmail();
         PracticeSessionService.PracticePromptData generated =
-                practiceSessionService.createInstantPrompt(request.topic(), request.level());
+                practiceSessionService.createInstantPrompt(userEmail, request.topic(), request.level());
 
         return ResponseEntity.ok(new PracticePromptResponse(
                 generated.promptId(),
@@ -42,6 +43,7 @@ public class PracticeController {
 
     @PostMapping("/next-prompt")
     public ResponseEntity<PracticePromptResponse> nextPrompt(@RequestBody(required = false) InstantSessionRequest request) {
+        String userEmail = currentUserService.requireUserEmail();
         String topic = request != null && request.topic() != null && !request.topic().isBlank()
                 ? request.topic()
                 : "work";
@@ -49,7 +51,7 @@ public class PracticeController {
                 ? request.level()
                 : "medium";
         PracticeSessionService.PracticePromptData generated =
-                practiceSessionService.createInstantPrompt(topic, level);
+                practiceSessionService.createInstantPrompt(userEmail, topic, level);
 
         return ResponseEntity.ok(new PracticePromptResponse(
                 generated.promptId(),

@@ -26,6 +26,7 @@ public class OpenAiEvaluationClientImpl implements OpenAiEvaluationClient {
 
     private static final Logger log = LoggerFactory.getLogger(OpenAiEvaluationClientImpl.class);
     private static final String DEFAULT_AI_URL = "https://api.openai.com/v1/responses";
+    private static final List<String> PROMPT_MODEL_FALLBACKS = List.of("llama-3.1-8b-instant", "gemma2-9b-it");
     private static final List<String> EVALUATION_MODEL_CANDIDATES = List.of("gpt-4.1", "gpt-4.1-mini");
     private static final Set<String> BASIC_STOPWORDS = Set.of(
             "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "had", "has", "have",
@@ -118,46 +119,94 @@ public class OpenAiEvaluationClientImpl implements OpenAiEvaluationClient {
 
         String normalizedLevel = normalizeLevel(request.level());
 
-        String instruction = "Bạn là trợ lý tạo câu hỏi luyện dịch Việt-Anh. " +
-                "Trả về JSON hợp lệ duy nhất theo schema: " +
+        String instruction = "Bạn là trợ lý tạo câu hỏi luyện dịch Việt–Anh. " +
+                "Luôn trả về duy nhất JSON hợp lệ theo schema: " +
                 "{\"direction\":\"vi_to_en|en_to_vi\",\"promptText\":\"string\",\"referenceAnswer\":\"string\",\"hint\":{" +
-                "\"grammarPattern\":\"string\",\"formula\":\"string\",\"keyVocabulary\":[\"string\",...],\"usageNote\":\"string\"}," +
-                "\"coreKeywords\":[\"string\",...]} . " +
-                "Mỗi lần tạo phải đa dạng bối cảnh và hành động, tránh lặp ý. " +
-                "Bắt buộc mở rộng phạm vi nội dung theo taxonomy đa dạng: planning, operations, customer service, healthcare, finance, legal compliance, procurement, logistics, training, incident response, digital transformation. " +
-                "Nếu topic=healthcare thì phải luân phiên nhiều nhóm ý: infection control, patient safety, triage, staffing, equipment procurement, insurance/billing, telemedicine, emergency readiness, staff training, patient communication; không được xoay quanh 1 motif duy nhất. " +
-                "`coreKeywords` bắt buộc 3-6 từ/cụm từ cốt lõi đại diện ý chính của câu, dùng để chống lặp ở các câu sau. " +
-                "`hint` phải cụ thể, không chung chung: grammarPattern nêu loại cấu trúc, formula nêu công thức câu, " +
-                "keyVocabulary gồm 3-5 từ/cụm từ trọng tâm để dùng đúng ngữ cảnh, usageNote giải thích ngắn cách dùng. " +
-                "Không được trả các câu mơ hồ kiểu 'dùng từ vựng liên quan ...'. " +
-                "Không thêm markdown, không thêm giải thích.";
+                "\"grammarPattern\":\"string\",\"formula\":\"string\",\"keyVocabulary\":[\"string\"],\"usageNote\":\"string\"},\"coreKeywords\":[\"string\"]}. " +
+                "Yêu cầu chung: " +
+                "Mỗi lần tạo câu phải đa dạng bối cảnh và hành động nhưng đi theo 1 topic chính. " +
+                "Trong 1 topic phải lựa chọn đa dạng danh từ, động từ, bối cảnh, tình huống. " +
+                "Câu hỏi phải nghe như một câu nói tự nhiên trong hội thoại 1-1 hằng ngày, gần với cách người thật nói chuyện. " +
+                "Ưu tiên ngữ điệu thân thiện, rõ ý, không máy móc. " +
+                "Chống lặp motif: không được dùng lại cùng mô típ mở đầu hoặc cùng khung diễn đạt với các câu gần đây. " +
+                "Đặc biệt tránh lặp các khung kiểu 'Tôi thường ... vì ...', 'Khi ... tôi thường ...', 'Vào ... tôi ...'. " +
+                "Ưu tiên intent hội thoại trực tiếp như hỏi, nhờ, xác nhận, đề nghị ngắn gọn thay vì văn kể thói quen dài dòng. " +
+                "Câu luyện dịch có thể là câu hỏi hoặc câu trần thuật, và cần luân phiên đa dạng giữa hai dạng này thay vì nghiêng hẳn về một dạng. " +
+                "coreKeywords gồm các từ vựng cốt lõi trong câu suggestion, mục đích để lần sau không tạo trùng lặp; " +
+                "coreKeywords phải bao gồm cả danh từ và động từ, và các từ này phải xuất hiện trong promptText hoặc referenceAnswer. " +
+                "recentKeywords là input chứa coreKeywords gần đây và không được tạo câu mới có từ vựng trùng hoặc quá tương đồng với recentKeywords. " +
+                "rejectedPrompts là input chứa 10 câu gần nhất; câu mới phải tránh lặp motif mở đầu, khung diễn đạt và cùng intent với rejectedPrompts. " +
+                "Nếu rejectedPrompts nghiêng về một nhánh shopping (ví dụ túi xách), câu mới phải chuyển sang nhánh khác (thanh toán, đổi trả, giao hàng, so sánh giá, thử đồ, khuyến mãi). " +
+                "hint phải cụ thể: grammarPattern nêu rõ loại cấu trúc, formula nêu công thức câu, " +
+                "keyVocabulary gồm 3–5 từ/cụm từ trọng tâm đúng ngữ cảnh, usageNote giải thích ngắn cách dùng. " +
+                "Không mơ hồ, không thêm markdown, không thêm giải thích ngoài JSON. " +
+                "Tránh lặp ý với các ngữ cảnh gần đây.";
 
-        String userPrompt = "Topic=" + request.topic() + ", level=" + normalizedLevel + ", targetLanguage=" + request.targetLanguage() +
-                ". Hãy tạo 1 câu hỏi thực tế cho bối cảnh công việc/đời sống. " +
-                buildDifficultyRule(normalizedLevel) +
-                " Không tạo câu quá giống với các mẫu cũ. " +
-                "Các prompt gần đây cần tránh trùng ý: " + String.join(" | ", request.recentPrompts() == null ? List.of() : request.recentPrompts()) + ". " +
-                "Các prompt vừa bị từ chối do trùng ý: " + String.join(" | ", request.rejectedPrompts() == null ? List.of() : request.rejectedPrompts()) + ". " +
-                "Danh sách coreKeywords đã dùng gần đây cần tránh lặp lại trong câu mới: " + String.join(", ", request.excludedWords() == null ? List.of() : request.excludedWords()) + ".";
+        String userPrompt = "Thiết lập hiện tại:\n" +
+                "Topic=" + request.topic() + ", level=" + normalizedLevel + ", targetLanguage=" + request.targetLanguage() + ".\n\n" +
+                "rejectedPrompts(10 câu gần nhất)=" + String.join(" | ", request.rejectedPrompts() == null ? List.of() : request.rejectedPrompts()) + "\n" +
+                "recentKeywords(10 câu gần nhất)=" + String.join(", ", request.excludedWords() == null ? List.of() : request.excludedWords()) + "\n\n" +
+                buildDifficultyRule(normalizedLevel) + "\n" +
+                "Nội dung thực tế trong bối cảnh công việc/đời sống. " +
+                "Hãy viết theo văn phong hội thoại 1-1 tự nhiên, như một người đang nói chuyện trực tiếp với người kia. " +
+                "Ưu tiên đa dạng dạng câu giữa câu hỏi và câu trần thuật trong các lần sinh gần nhau. " +
+                "Quan trọng: nếu rejectedPrompts có motif giống nhau thì câu mới bắt buộc đổi motif rõ rệt.";
 
-        try {
-            JsonNode root = callOpenAi(instruction, userPrompt);
-            logUsage(root, "generatePrompt");
-
-            String outputText = extractOutputText(root);
-            JsonNode parsed = objectMapper.readTree(normalizeJsonOutput(outputText));
-
-            return new GeneratedPrompt(
-                    parsed.path("direction").asText("vi_to_en"),
-                    parsed.path("promptText").asText("Dịch sang tiếng Anh: 'Bạn có thể gửi giúp tôi tài liệu này không?'"),
-                    parsed.path("referenceAnswer").asText("Could you help send me this document?"),
-                    parsePromptHint(parsed.path("hint")),
-                    parseCoreKeywords(parsed.path("coreKeywords"))
-            );
-        } catch (Exception ex) {
-            log.error("openai.generatePrompt.error, fallback to random template", ex);
-            return randomFallbackPrompt();
+        List<String> modelCandidates = new ArrayList<>();
+        modelCandidates.add(appProperties.openai().model());
+        for (String candidate : PROMPT_MODEL_FALLBACKS) {
+            if (!modelCandidates.contains(candidate)) {
+                modelCandidates.add(candidate);
+            }
         }
+
+        Exception lastException = null;
+        for (String model : modelCandidates) {
+            try {
+                JsonNode root = callOpenAi(model, instruction, userPrompt, "generatePrompt");
+                logUsage(root, "generatePrompt");
+
+                String outputText = extractOutputText(root);
+                log.info("openai.generatePrompt.outputText model={} outputText={}", model, outputText);
+                JsonNode parsed = objectMapper.readTree(normalizeJsonOutput(outputText));
+
+                return new GeneratedPrompt(
+                        parsed.path("direction").asText("vi_to_en"),
+                        parsed.path("promptText").asText("Dịch sang tiếng Anh: 'Bạn có thể gửi giúp tôi tài liệu này không?'"),
+                        parsed.path("referenceAnswer").asText("Could you help send me this document?"),
+                        parsePromptHint(parsed.path("hint")),
+                        parseCoreKeywords(parsed.path("coreKeywords"))
+                );
+            } catch (OpenAiHttpException ex) {
+                lastException = ex;
+                log.warn("openai.generatePrompt.model.failed model={} status={} code={} message={}",
+                        model,
+                        ex.statusCode(),
+                        ex.errorCode(),
+                        truncate(ex.errorMessage(), 300));
+            } catch (Exception ex) {
+                lastException = ex;
+                log.warn("openai.generatePrompt.model.failed model={} reason={} message={}",
+                        model,
+                        ex.getClass().getSimpleName(),
+                        truncate(ex.getMessage(), 300));
+            }
+        }
+
+        if (lastException instanceof OpenAiHttpException httpEx) {
+            log.error("openai.generatePrompt.error fallback=random-template status={} code={} message={}",
+                    httpEx.statusCode(),
+                    httpEx.errorCode(),
+                    truncate(httpEx.errorMessage(), 300));
+        } else if (lastException != null) {
+            log.error("openai.generatePrompt.error fallback=random-template reason={} message={}",
+                    lastException.getClass().getSimpleName(),
+                    truncate(lastException.getMessage(), 300));
+        } else {
+            log.error("openai.generatePrompt.error fallback=random-template reason=unknown");
+        }
+
+        return randomFallbackPrompt();
     }
 
     @Override
@@ -213,6 +262,7 @@ public class OpenAiEvaluationClientImpl implements OpenAiEvaluationClient {
                 logUsage(root, "evaluate");
 
                 String outputText = extractOutputText(root);
+                log.info("openai.evaluate.outputText model={} outputText={}", model, outputText);
                 JsonNode parsed = objectMapper.readTree(normalizeJsonOutput(outputText));
                 List<OpenAiEvaluationClient.VocabularyHint> vocabularyHints = parseVocabularyHints(
                         parsed,
@@ -278,6 +328,13 @@ public class OpenAiEvaluationClientImpl implements OpenAiEvaluationClient {
         String apiUrl = resolveAiUrl();
         boolean chatCompletionsMode = apiUrl.contains("/chat/completions");
 
+        log.info("openai.{}.request model={} endpoint={} instruction={} userPrompt={}",
+                operation,
+                model,
+                apiUrl,
+                instruction,
+                userPrompt);
+
         Map<String, Object> payload = chatCompletionsMode
                 ? Map.of(
                 "model", model,
@@ -309,7 +366,7 @@ public class OpenAiEvaluationClientImpl implements OpenAiEvaluationClient {
 
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() < 200 || response.statusCode() > 299) {
-            throw new IllegalStateException("OpenAI call failed, status=" + response.statusCode() + ", body=" + response.body());
+            throw buildOpenAiHttpException(response.statusCode(), response.body());
         }
 
         long latencyMs = (System.nanoTime() - startedAt) / 1_000_000;
@@ -321,6 +378,59 @@ public class OpenAiEvaluationClientImpl implements OpenAiEvaluationClient {
         }
 
         return rawRoot;
+    }
+
+    private OpenAiHttpException buildOpenAiHttpException(int statusCode, String body) {
+        String errorCode = "http_error";
+        String errorMessage = "OpenAI call failed";
+
+        try {
+            JsonNode root = objectMapper.readTree(body == null ? "" : body);
+            JsonNode error = root.path("error");
+            if (!error.isMissingNode()) {
+                String parsedCode = error.path("code").asText("").trim();
+                String parsedMessage = error.path("message").asText("").trim();
+                if (!parsedCode.isBlank()) {
+                    errorCode = parsedCode;
+                }
+                if (!parsedMessage.isBlank()) {
+                    errorMessage = parsedMessage;
+                }
+            }
+        } catch (Exception ignored) {
+            // keep defaults
+        }
+
+        if (errorMessage.equals("OpenAI call failed") && body != null && !body.isBlank()) {
+            errorMessage = body;
+        }
+
+        return new OpenAiHttpException(statusCode, errorCode, errorMessage);
+    }
+
+    private static final class OpenAiHttpException extends IllegalStateException {
+        private final int statusCode;
+        private final String errorCode;
+        private final String errorMessage;
+
+        private OpenAiHttpException(int statusCode, String errorCode, String errorMessage) {
+            super("OpenAI call failed, status=" + statusCode + ", code=" + errorCode + ", message=" + errorMessage);
+            this.statusCode = statusCode;
+            this.errorCode = errorCode == null ? "" : errorCode;
+            this.errorMessage = errorMessage == null ? "" : errorMessage;
+        }
+
+        public int statusCode() {
+            return statusCode;
+        }
+
+        public String errorCode() {
+            return errorCode;
+        }
+
+        public String errorMessage() {
+            return errorMessage;
+        }
     }
 
     private String resolveAiUrl() {
@@ -503,9 +613,9 @@ public class OpenAiEvaluationClientImpl implements OpenAiEvaluationClient {
 
     private String buildDifficultyRule(String level) {
         return switch (level) {
-            case "easy" -> " Ràng buộc độ khó: easy => câu ngắn, 1 mệnh đề chính, từ vựng cơ bản, thì đơn giản.";
-            case "hard" -> " Ràng buộc độ khó: hard => câu dài hơn, có mệnh đề phụ/cấu trúc phức, từ vựng nâng cao, có thể dùng thì hoàn thành hoặc điều kiện.";
-            default -> " Ràng buộc độ khó: medium => câu ghép 2 ý liên kết hợp lý, từ vựng trung bình-khá, ngữ pháp đa dạng hơn easy.";
+            case "easy" -> "Ràng buộc độ khó easy: câu đơn hoặc câu ngắn, 1 ý chính, từ vựng cơ bản, ngữ pháp đơn giản.";
+            case "hard" -> "Ràng buộc độ khó hard: câu dài hoặc nhiều mệnh đề, từ vựng nâng cao, cấu trúc ngữ pháp phức tạp hơn medium.";
+            default -> "Ràng buộc độ khó medium: câu ghép gồm 2 ý liên kết hợp lý, từ vựng trung bình–khá, ngữ pháp đa dạng hơn easy.";
         };
     }
 

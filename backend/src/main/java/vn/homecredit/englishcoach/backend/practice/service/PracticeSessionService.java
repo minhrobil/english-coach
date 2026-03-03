@@ -30,6 +30,7 @@ public class PracticeSessionService {
 
     private static final Logger log = LoggerFactory.getLogger(PracticeSessionService.class);
     private static final int PROMPT_DIVERSITY_HISTORY_SIZE = 30;
+    private static final int PROMPT_REJECTED_PROMPTS_WINDOW = 10;
     private static final int PROMPT_CORE_KEYWORDS_WINDOW = 10;
     private static final int PROMPT_REGENERATE_MAX_ATTEMPTS = 5;
     private static final double PROMPT_SIMILARITY_MAX_SCORE = 0.72d;
@@ -46,12 +47,12 @@ public class PracticeSessionService {
         this.topicKeywordHistory = new ConcurrentHashMap<>();
     }
 
-    public PracticePromptData createInstantPrompt(String topic, String level) {
+    public PracticePromptData createInstantPrompt(String userEmail, String topic, String level) {
         String safeLevel = normalizeLevel(level);
         String safeTopic = normalizeTopic(topic);
-        List<String> recentPrompts = getRecentPromptsByTopic(safeTopic, PROMPT_DIVERSITY_HISTORY_SIZE);
+        List<String> recentPrompts = getRecentPromptsByUserAndTopic(userEmail, safeTopic, PROMPT_DIVERSITY_HISTORY_SIZE);
+        List<String> rejectedPrompts = getRecentPromptsByUserAndTopic(userEmail, safeTopic, PROMPT_REJECTED_PROMPTS_WINDOW);
         List<String> excludedWords = getRecentCoreKeywords(safeTopic);
-        List<String> rejectedPrompts = new ArrayList<>();
 
         OpenAiEvaluationClient.GeneratedPrompt generated = null;
         for (int attempt = 0; attempt < PROMPT_REGENERATE_MAX_ATTEMPTS; attempt++) {
@@ -71,8 +72,6 @@ public class PracticeSessionService {
                 generated = candidate;
                 break;
             }
-
-            rejectedPrompts.add(candidate.promptText());
         }
 
         if (generated == null) {
@@ -90,8 +89,11 @@ public class PracticeSessionService {
 
         rememberCoreKeywords(safeTopic, generated.coreKeywords());
 
+        UUID promptId = UUID.randomUUID();
+        rememberIssuedPrompt(userEmail, promptId, safeTopic, safeLevel);
+
         return new PracticePromptData(
-                UUID.randomUUID(),
+                promptId,
                 generated.direction(),
                 generated.promptText(),
                 generated.referenceAnswer(),
@@ -102,18 +104,74 @@ public class PracticeSessionService {
         );
     }
 
-    private List<String> getRecentPromptsByTopic(String topic, int limit) {
+    private List<String> getRecentPromptsByUserAndTopic(String userEmail, String topic, int limit) {
         int safeLimit = Math.max(1, Math.min(limit, 60));
+        String safeUserEmail = String.valueOf(userEmail == null ? "" : userEmail).trim();
+        String safeTopic = normalizeTopic(topic);
+
+        if (safeUserEmail.isBlank()) {
+            return List.of();
+        }
+
         return jdbcTemplate.query(
                 """
                 SELECT source_sentence
                 FROM practice_history
+                WHERE user_email = ?
+                  AND LOWER(COALESCE(prompt_topic, '')) = ?
                 ORDER BY submitted_at DESC
                 LIMIT ?
                 """,
                 (rs, rowNum) -> rs.getString("source_sentence"),
+                safeUserEmail,
+                safeTopic,
                 safeLimit
         );
+    }
+
+    private void rememberIssuedPrompt(String userEmail, UUID promptId, String topic, String level) {
+        String safeUserEmail = String.valueOf(userEmail == null ? "" : userEmail).trim();
+        if (safeUserEmail.isBlank() || promptId == null) {
+            return;
+        }
+        jdbcTemplate.update(
+                """
+                INSERT INTO practice_prompt_issue (prompt_id, user_email, prompt_topic, prompt_level, issued_at)
+                VALUES (?, ?, ?, ?, NOW())
+                ON CONFLICT (prompt_id)
+                DO UPDATE SET
+                  user_email = EXCLUDED.user_email,
+                  prompt_topic = EXCLUDED.prompt_topic,
+                  prompt_level = EXCLUDED.prompt_level,
+                  issued_at = NOW()
+                """,
+                promptId,
+                safeUserEmail,
+                normalizeTopic(topic),
+                normalizeLevel(level)
+        );
+    }
+
+    private String resolvePromptTopic(String userEmail, UUID promptId) {
+        String safeUserEmail = String.valueOf(userEmail == null ? "" : userEmail).trim();
+        if (safeUserEmail.isBlank() || promptId == null) {
+            return "work";
+        }
+        try {
+            String topic = jdbcTemplate.queryForObject(
+                    """
+                    SELECT prompt_topic
+                    FROM practice_prompt_issue
+                    WHERE user_email = ? AND prompt_id = ?
+                    """,
+                    String.class,
+                    safeUserEmail,
+                    promptId
+            );
+            return normalizeTopic(topic);
+        } catch (Exception ex) {
+            return "work";
+        }
     }
 
     private List<String> getRecentCoreKeywords(String topic) {
@@ -249,6 +307,7 @@ public class PracticeSessionService {
         );
 
         String vocabularyHintsJson = writeVocabularyHintsJson(submitted.vocabularyHints());
+        String promptTopic = resolvePromptTopic(userEmail, promptId);
         Instant submittedAt = Instant.now();
         Timestamp submittedAtTimestamp = Timestamp.from(submittedAt);
         log.info("practice.submit.insert.start answerId={} userEmail={} submittedAtClass={} submittedAtValue={}",
@@ -256,12 +315,12 @@ public class PracticeSessionService {
         jdbcTemplate.update(
                 """
                 INSERT INTO practice_history (
-                  answer_id, user_email, prompt_id, source_sentence, reference_answer, user_answer,
+                  answer_id, user_email, prompt_topic, prompt_id, source_sentence, reference_answer, user_answer,
                   overall_score, grammar_score, naturalness_score, vocabulary_score,
                   explanation, better_phrasing, vocabulary_hints_json, evaluation_status, highlighted, submitted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                submitted.answerId(), userEmail, submitted.promptId(), sourceSentence, referenceAnswer, userAnswer,
+                submitted.answerId(), userEmail, promptTopic, submitted.promptId(), sourceSentence, referenceAnswer, userAnswer,
                 submitted.overallScore(), submitted.grammarScore(), submitted.naturalnessScore(), submitted.vocabularyScore(),
                 submitted.explanation(), submitted.betterPhrasing(), vocabularyHintsJson, submitted.evaluationStatus(), false, submittedAtTimestamp
         );
